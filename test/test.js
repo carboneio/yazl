@@ -1,4 +1,6 @@
 var fs = require("fs");
+var zlib = require("zlib");
+var crc32 = require("buffer-crc32");
 var yazl = require("../");
 var yauzl = require("yauzl");
 var BufferList = require("./bl-minimal.js");
@@ -349,6 +351,94 @@ var weirdChars = '\u0000☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕�
   }
   if (!gotError) throw new Error("expected error for adding after calling end()");
 })();
+
+// Test:
+//  * addBuffer deflates a large buffer in several pieces at once,
+//    and the concatenation is still an ordinary deflate stream that an unzipper reads.
+//  * a buffer too small to be worth splitting is deflated in one piece, byte for byte as before.
+//  * the crc32 written in the zipfile is the one buffer-crc32 computes,
+//    whichever implementation yazl picked to compute it.
+(function() {
+  var contents = {
+    "big.xml": makeXmlishBuffer(9 * 1024 * 1024), // above the threshold: deflated in pieces.
+    "small.xml": makeXmlishBuffer(64 * 1024),     // below the threshold: deflated in one piece.
+  };
+  var zipfile = new yazl.ZipFile();
+  Object.keys(contents).forEach(function(fileName) {
+    zipfile.addBuffer(contents[fileName], fileName);
+  });
+  zipfile.on("error", function(err) {
+    throw err;
+  });
+  zipfile.end(function() {
+    zipfile.outputStream.pipe(new BufferList(function(err, data) {
+      if (err) throw err;
+      yauzl.fromBuffer(data, function(err, zipfile) {
+        if (err) throw err;
+        zipfile.on("entry", function(entry) {
+          var expectedContents = contents[entry.fileName];
+          if (expectedContents == null) throw new Error("unexpected entry: " + entry.fileName);
+          if (entry.compressionMethod !== 8) throw new Error("expected " + entry.fileName + " to be deflated. found compression method: " + entry.compressionMethod);
+
+          var expectedCrc32 = crc32.unsigned(expectedContents);
+          if (entry.crc32 !== expectedCrc32) throw new Error("wrong crc32 for " + entry.fileName + ". " + entry.crc32 + " !== " + expectedCrc32);
+
+          var onePieceSize = zlib.deflateRawSync(expectedContents, {level: 6}).length;
+          if (entry.fileName === "big.xml") {
+            // A piece cannot back-reference the previous one, so splitting always costs a few bytes.
+            if (!(entry.compressedSize > onePieceSize)) throw new Error("expected " + entry.fileName + " to be deflated in several pieces. " + entry.compressedSize + " <= " + onePieceSize);
+            if (!(entry.compressedSize < onePieceSize * 1.01)) throw new Error("deflating " + entry.fileName + " in pieces cost more than 1% of the compressed size. " + entry.compressedSize + " vs " + onePieceSize);
+          } else {
+            if (entry.compressedSize !== onePieceSize) throw new Error("expected " + entry.fileName + " to be deflated in one piece. " + entry.compressedSize + " !== " + onePieceSize);
+          }
+
+          zipfile.openReadStream(entry, function(err, readStream) {
+            if (err) throw err;
+            readStream.pipe(new BufferList(function(err, data) {
+              if (err) throw err;
+              if (!expectedContents.equals(data)) throw new Error("unexpected contents for " + entry.fileName);
+              console.log("parallel deflate(" + entry.fileName + "): pass");
+            }));
+          });
+        });
+      });
+    }));
+  });
+})();
+
+// Test:
+//  * the crc32 of a streamed entry, accumulated chunk by chunk, is the one buffer-crc32 computes.
+(function() {
+  var expectedContents = fs.readFileSync(__filename);
+  var expectedCrc32 = crc32.unsigned(expectedContents);
+  var zipfile = new yazl.ZipFile();
+  // The small highWaterMark forces the crc32 to be accumulated over many chunks.
+  zipfile.addReadStream(fs.createReadStream(__filename, {highWaterMark: 1024}), "chunked.txt");
+  zipfile.end(function() {
+    zipfile.outputStream.pipe(new BufferList(function(err, data) {
+      if (err) throw err;
+      yauzl.fromBuffer(data, function(err, zipfile) {
+        if (err) throw err;
+        zipfile.on("entry", function(entry) {
+          if (entry.crc32 !== expectedCrc32) throw new Error("wrong crc32 for " + entry.fileName + ". " + entry.crc32 + " !== " + expectedCrc32);
+          console.log("chunked crc32: pass");
+        });
+      });
+    }));
+  });
+})();
+
+// Builds compressible but not repetitive ascii content of about byteLength bytes.
+function makeXmlishBuffer(byteLength) {
+  var lines = [];
+  var totalLength = 0;
+  for (var i = 0; totalLength < byteLength; i++) {
+    var line = '<row id="' + i + '"><cell>value ' + (i % 97) + "</cell><cell>" + ((i * 7919) % 1000003) + "</cell></row>\n";
+    lines.push(line);
+    totalLength += line.length;
+  }
+  return bufferFrom(lines.join(""), "utf-8");
+}
 
 function bufferFrom(something, encoding) {
   bufferFrom = modern;

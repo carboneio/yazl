@@ -1,3 +1,52 @@
+## Forked by [Carbone](https://carbone.io)
+
+<div align="center">
+  <a href="https://www.npmjs.com/package/@carboneio/yazl">
+    <img
+      src="https://img.shields.io/npm/v/@carboneio/yazl.svg?style=flat-square"
+      alt="NPM Version"
+    />
+  </a>
+  <a href="https://prettier.io/">
+    <img
+      src="https://img.shields.io/badge/code_style-prettier-ff69b4.svg?style=flat-square"
+      alt="Prettier Badge"
+    />
+  </a>
+  <a href="https://github.com/carboneio/yazl">
+    <img
+      src="https://img.shields.io/badge/Maintained%3F-yes-green.svg?style=flat-square"
+      alt="Maintenance"
+    />
+  </a>
+</div>
+
+This package is a fork of [thejoshwolfe/yazl](https://github.com/thejoshwolfe/yazl) optimized and maintained by [Carbone](https://carbone.io) to provide the fastest zip library for Node.js.
+
+We will maintain this project as long as it is relevant to our needs. Please note we cannot guarantee support for issues that fall outside our own roadmap.
+
+Install with: `npm install @carboneio/yazl`
+
+### Optimizations in this fork
+
+* The CRC-32 of each entry is computed by `zlib.crc32` when the running Node provides it (since v20.15.0), instead of the byte-by-byte JavaScript loop of `buffer-crc32`. On 100 MB of XML this takes 4 ms instead of 193 ms. Older versions of Node keep using `buffer-crc32`, which answers the same number.
+* `addBuffer()` deflates buffers larger than 8 MB in up to 4 pieces at once on the libuv threadpool, rather than in one go on a single thread. Every piece but the last is closed on a byte boundary (`Z_SYNC_FLUSH`), so their concatenation is an ordinary deflate stream that any unzipper reads. A piece cannot back-reference the previous one, so the compressed data grows by about 0.01%.
+
+Time to build a whole archive in memory out of XML files, from the first `addBuffer()` to the last byte of `outputStream`:
+
+| Payload | Files | Before | After | Speedup | Archive size |
+| ------- | ----- | ------ | ----- | ------- | ------------ |
+| 100 KB | 1 | 1.1 ms | 0.7 ms | 1.6x | +0% |
+| 1 MB | 10 | 2.9 ms | 2.0 ms | 1.5x | +0% |
+| 10 MB | 1 | 80.9 ms | 33.0 ms | 2.5x | +0.017% |
+| 100 MB | 1 | 812.9 ms | 171.6 ms | 4.7x | +0.006% |
+
+Median of 5 runs on Node v22.22.2, 14 cores (Apple M4 Max), libuv threadpool of 4.
+Payloads below the 8 MB threshold are deflated in one piece as before, so only the checksum gets faster and the archive is unchanged, byte for byte.
+
+Run `npm run benchmark` to reproduce these numbers on your own machine. The "before" column is measured by reloading this very same `index.js` with both optimizations disabled, so the two runs differ by nothing else.
+
+
 # yazl
 
 yet another zip library for node. For unzipping, see

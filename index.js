@@ -10,6 +10,49 @@ var crc32 = require("buffer-crc32");
 exports.ZipFile = ZipFile;
 exports.dateToDosDateTime = dateToDosDateTime;
 
+// buffer-crc32 reads its input one byte at a time in JavaScript, which costs about a fifth
+// of a second per hundred megabytes. Node computes the same checksum in C since v20.15.0,
+// so it is given the work whenever it is available.
+var computeCrc32 = typeof zlib.crc32 === "function" ? function(buffer, previous) {
+  return zlib.crc32(buffer, previous != null ? previous : 0);
+} : function(buffer, previous) {
+  return crc32.unsigned(buffer, previous);
+};
+
+// zlib compresses a buffer in one go on a single thread. Deflate reads its input in a
+// single pass, so a large buffer can be cut in pieces, compressed side by side on the
+// threadpool, and glued back together: every piece but the last is closed on a byte
+// boundary (Z_SYNC_FLUSH), which leaves the concatenation an ordinary deflate stream that
+// any unzipper reads. A piece cannot back-reference what a previous one said, so the
+// compressed output grows by roughly a thousandth of its size.
+var MIN_BYTES_PER_DEFLATE_PIECE = 4 * 1024 * 1024;
+var MAX_DEFLATE_PIECES = 4;
+function deflateRawInPieces(buffer, options, callback) {
+  var pieceCount = Math.min(MAX_DEFLATE_PIECES, Math.floor(buffer.length / MIN_BYTES_PER_DEFLATE_PIECE));
+  if (pieceCount < 2) return zlib.deflateRaw(buffer, options, callback);
+
+  var pieceSize = Math.ceil(buffer.length / pieceCount);
+  var pieces = new Array(pieceCount);
+  var piecesRemaining = pieceCount;
+  var firstError = null;
+  for (var i = 0; i < pieceCount; i++) {
+    deflatePiece(i);
+  }
+  function deflatePiece(index) {
+    var isLastPiece = index === pieceCount - 1;
+    var pieceOptions = {level: options.level};
+    if (!isLastPiece) pieceOptions.finishFlush = zlib.constants.Z_SYNC_FLUSH;
+    var end = isLastPiece ? buffer.length : (index + 1) * pieceSize;
+    zlib.deflateRaw(buffer.subarray(index * pieceSize, end), pieceOptions, function(err, compressedPiece) {
+      if (err != null && firstError == null) firstError = err;
+      pieces[index] = compressedPiece;
+      if (--piecesRemaining !== 0) return;
+      if (firstError != null) return callback(firstError);
+      callback(null, Buffer.concat(pieces));
+    });
+  }
+}
+
 util.inherits(ZipFile, EventEmitter);
 function ZipFile() {
   this.outputStream = new PassThrough();
@@ -88,13 +131,14 @@ ZipFile.prototype.addBuffer = function(buffer, metadataPath, options) {
   if (shouldIgnoreAdding(self)) return;
   var entry = new Entry(metadataPath, false, options);
   entry.uncompressedSize = buffer.length;
-  entry.crc32 = crc32.unsigned(buffer);
+  entry.crc32 = computeCrc32(buffer);
   entry.crcAndFileSizeKnown = true;
   self.entries.push(entry);
   if (entry.compressionLevel === 0) {
     setCompressedBuffer(buffer);
   } else {
-    zlib.deflateRaw(buffer, {level:entry.compressionLevel}, function(err, compressedBuffer) {
+    deflateRawInPieces(buffer, {level:entry.compressionLevel}, function(err, compressedBuffer) {
+      if (err) return self.emit("error", err);
       setCompressedBuffer(compressedBuffer);
     });
   }
@@ -740,7 +784,7 @@ function Crc32Watcher(options) {
   this.crc32 = 0;
 }
 Crc32Watcher.prototype._transform = function(chunk, encoding, cb) {
-  this.crc32 = crc32.unsigned(chunk, this.crc32);
+  this.crc32 = computeCrc32(chunk, this.crc32);
   cb(null, chunk);
 };
 

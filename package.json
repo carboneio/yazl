@@ -1,14 +1,15 @@
 {
-  "name": "yazl",
+  "name": "@carboneio/yazl",
   "version": "3.3.1",
-  "description": "yet another zip library for node",
+  "description": "yet another optimized zip library for node",
   "main": "index.js",
   "scripts": {
-    "test": "node test/test.js"
+    "test": "node test/test.js",
+    "benchmark": "node benchmark/benchmark.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thejoshwolfe/yazl.git"
+    "url": "git+https://github.com/carboneio/yazl.git"
   },
   "keywords": [
     "zip",
@@ -16,12 +17,12 @@
     "archive",
     "file"
   ],
-  "author": "Josh Wolfe <thejoshwolfe@gmail.com>",
+  "author": "Carbone <support@carbone.io>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/thejoshwolfe/yazl/issues"
+    "url": "https://github.com/carboneio/yazl/issues"
   },
-  "homepage": "https://github.com/thejoshwolfe/yazl",
+  "homepage": "https://github.com/carboneio/yazl",
   "dependencies": {
     "buffer-crc32": "^1.0.0"
   },
