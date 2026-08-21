@@ -2,7 +2,8 @@
 // buffer-crc32, and large buffers deflated in several pieces at once instead of one go.
 //
 // The "before" numbers come from this very same index.js with both optimizations turned
-// off, so the two runs differ by nothing else.
+// off, so the two yazl runs differ by nothing else. archiver is timed on the same files
+// at the same compression level (6), also entirely in memory.
 //
 // Run with: npm run benchmark [-- ITERATIONS]
 
@@ -10,6 +11,7 @@ var fs = require("fs");
 var os = require("os");
 var path = require("path");
 var Writable = require("stream").Writable;
+var ZipArchive = require("archiver").ZipArchive;
 
 var ITERATIONS = Number(process.argv[2]) || 5;
 
@@ -31,33 +33,40 @@ function runCase(caseIndex) {
   var testCase = CASES[caseIndex];
   var files = splitIntoFiles(makeXmlishBuffer(testCase.totalSize), testCase.fileCount);
 
-  timeZipping(before, files, function(beforeMs, beforeSize) {
-    timeZipping(after, files, function(afterMs, afterSize) {
-      rows.push({
-        payload: testCase.payload,
-        fileCount: testCase.fileCount,
-        beforeMs: beforeMs,
-        afterMs: afterMs,
-        beforeSize: beforeSize,
-        afterSize: afterSize,
+  timeZipping(function(cb) { zipOnceYazl(before, files, cb); }, function(beforeMs, beforeSize) {
+    timeZipping(function(cb) { zipOnceYazl(after, files, cb); }, function(afterMs, afterSize) {
+      timeZipping(function(cb) { zipOnceArchiver(files, cb); }, function(archiverMs, archiverSize) {
+        rows.push({
+          payload: testCase.payload,
+          fileCount: testCase.fileCount,
+          beforeMs: beforeMs,
+          afterMs: afterMs,
+          archiverMs: archiverMs,
+          beforeSize: beforeSize,
+          afterSize: afterSize,
+          archiverSize: archiverSize,
+        });
+        console.error(
+          testCase.payload + ": yazl " + beforeMs.toFixed(1) + " ms -> " + afterMs.toFixed(1) +
+          " ms, archiver " + archiverMs.toFixed(1) + " ms"
+        );
+        runCase(caseIndex + 1);
       });
-      console.error(testCase.payload + ": " + beforeMs.toFixed(1) + " ms -> " + afterMs.toFixed(1) + " ms");
-      runCase(caseIndex + 1);
     });
   });
 }
 
 // Zips the files ITERATIONS times, plus one warmup round that is thrown away,
 // and reports the median duration.
-function timeZipping(yazl, files, callback) {
+function timeZipping(zipOnce, callback) {
   var durations = [];
   var archiveSize = 0;
-  zipOnce(yazl, files, function() {
+  zipOnce(function() {
     next();
   });
   function next() {
     if (durations.length === ITERATIONS) return callback(median(durations), archiveSize);
-    zipOnce(yazl, files, function(duration, byteCount) {
+    zipOnce(function(duration, byteCount) {
       durations.push(duration);
       archiveSize = byteCount;
       // Let the event loop breathe so the previous run is fully torn down.
@@ -68,38 +77,58 @@ function timeZipping(yazl, files, callback) {
 
 // Builds a whole archive in memory, from the first addBuffer() to the last byte
 // of the output stream. Nothing is written to disk, so this measures cpu only.
-function zipOnce(yazl, files, callback) {
+function zipOnceYazl(yazl, files, callback) {
   var startedAt = performance.now();
   var zipfile = new yazl.ZipFile();
   zipfile.on("error", function(err) {
     throw err;
   });
-  var byteCount = 0;
-  zipfile.outputStream.pipe(new Writable({
-    write: function(chunk, encoding, cb) {
-      byteCount += chunk.length;
-      cb();
-    },
-  })).on("finish", function() {
-    callback(performance.now() - startedAt, byteCount);
-  });
+  zipfile.outputStream.pipe(countingSink(startedAt, callback));
   for (var i = 0; i < files.length; i++) {
     zipfile.addBuffer(files[i], "file" + i + ".xml");
   }
   zipfile.end();
 }
 
+function zipOnceArchiver(files, callback) {
+  var startedAt = performance.now();
+  // Same default compression level as yazl (6).
+  var archive = new ZipArchive({zlib: {level: 6}});
+  archive.on("error", function(err) {
+    throw err;
+  });
+  archive.pipe(countingSink(startedAt, callback));
+  for (var i = 0; i < files.length; i++) {
+    archive.append(files[i], {name: "file" + i + ".xml"});
+  }
+  archive.finalize();
+}
+
+function countingSink(startedAt, callback) {
+  var byteCount = 0;
+  return new Writable({
+    write: function(chunk, encoding, cb) {
+      byteCount += chunk.length;
+      cb();
+    },
+  }).on("finish", function() {
+    callback(performance.now() - startedAt, byteCount);
+  });
+}
+
 function report() {
   console.error("");
-  console.log("| Payload | Files | Before | After | Speedup | Archive size |");
-  console.log("| ------- | ----- | ------ | ----- | ------- | ------------ |");
+  console.log("| Payload | Files | yazl before | yazl after | archiver | vs before | vs archiver | Archive size |");
+  console.log("| ------- | ----- | ----------- | ---------- | -------- | --------- | ----------- | ------------ |");
   rows.forEach(function(row) {
     console.log(
       "| " + row.payload +
       " | " + row.fileCount +
       " | " + row.beforeMs.toFixed(1) + " ms" +
       " | " + row.afterMs.toFixed(1) + " ms" +
+      " | " + row.archiverMs.toFixed(1) + " ms" +
       " | " + (row.beforeMs / row.afterMs).toFixed(1) + "x" +
+      " | " + (row.archiverMs / row.afterMs).toFixed(1) + "x" +
       " | " + formatGrowth(row.beforeSize, row.afterSize) +
       " |"
     );
@@ -109,6 +138,10 @@ function report() {
     "Median of " + ITERATIONS + " runs on Node " + process.version + ", " +
     describeCpu() + ", " +
     "libuv threadpool of " + (process.env.UV_THREADPOOL_SIZE || 4) + "."
+  );
+  console.log(
+    "archiver " + archiverVersion() +
+    " at zlib level 6, the same default yazl uses. Archive size is yazl after vs yazl before."
   );
 }
 
@@ -163,6 +196,11 @@ function median(numbers) {
   });
   var middle = sorted.length >> 1;
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function archiverVersion() {
+  var dir = path.dirname(require.resolve("archiver"));
+  return JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf-8")).version;
 }
 
 function describeCpu() {
